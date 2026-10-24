@@ -48,7 +48,8 @@ class GrantMilestoneReleaser(gl.Contract):
             "grantee_address": grantee_address,
             "title": title,
             "total_usd": total_usd,
-            "released_usd": 0,
+            "committed_usd": 0,     # sum of all milestone tranches added so far
+            "released_usd": 0,      # sum of tranches for passed milestones
             "milestone_count": 0,
             "active": True,
         })
@@ -90,6 +91,11 @@ class GrantMilestoneReleaser(gl.Contract):
         if not grant["active"]:
             raise Exception("Grant is no longer active")
 
+        # Budget enforcement: total committed tranches may never exceed total_usd
+        committed = int(grant.get("committed_usd", 0))
+        if committed + tranche_usd > int(grant["total_usd"]):
+            raise Exception("Milestone tranche would exceed the grant total budget")
+
         self.milestones[milestone_id] = json.dumps({
             "milestone_id": milestone_id,
             "grant_id": grant_id,
@@ -102,7 +108,7 @@ class GrantMilestoneReleaser(gl.Contract):
             "ai_reasoning": "",
         })
 
-        # increment milestone count on the grant
+        grant["committed_usd"] = committed + tranche_usd
         grant["milestone_count"] = grant["milestone_count"] + 1
         self.grants[grant_id] = json.dumps(grant)
 
@@ -125,10 +131,14 @@ class GrantMilestoneReleaser(gl.Contract):
         is marked as released.
 
         submission_id : unique identifier for this submission attempt
+                        (must not already exist)
         milestone_id  : must match an existing milestone
         evidence_urls : comma-separated list of URLs (PR links, demo URLs, report links)
         notes         : optional plain-language context from the grantee
         """
+        # Never overwrite a prior submission record
+        if submission_id in self.submissions:
+            raise Exception("Submission ID already exists")
         if milestone_id not in self.milestones:
             raise Exception("Milestone not found")
 
@@ -148,6 +158,10 @@ class GrantMilestoneReleaser(gl.Contract):
         grantee_addr = Address(grant["grantee_address"])
         if gl.message.sender_address != grantee_addr:
             raise Exception("Only the grantee can submit milestone evidence")
+
+        # Budget enforcement: a release may never push released_usd past total_usd
+        if int(grant["released_usd"]) + int(milestone["tranche_usd"]) > int(grant["total_usd"]):
+            raise Exception("Release would exceed the grant total budget")
 
         spec = milestone["spec"]
         title = milestone["title"]
@@ -221,7 +235,7 @@ class GrantMilestoneReleaser(gl.Contract):
 
         # ---- deterministic: update state ----
 
-        # record the submission
+        # record the submission (ID uniqueness was checked up front)
         self.submissions[submission_id] = json.dumps({
             "submission_id": submission_id,
             "milestone_id": milestone_id,
@@ -242,7 +256,7 @@ class GrantMilestoneReleaser(gl.Contract):
 
         # if passed, record the tranche release on the grant
         if passed:
-            grant["released_usd"] = grant["released_usd"] + milestone["tranche_usd"]
+            grant["released_usd"] = int(grant["released_usd"]) + int(milestone["tranche_usd"])
             self.grants[grant_id] = json.dumps(grant)
 
     # ----------------------------------------------------------------
@@ -292,6 +306,14 @@ class GrantMilestoneReleaser(gl.Contract):
             return 0
         grant = json.loads(self.grants[grant_id])
         return int(grant["released_usd"])
+
+    @gl.public.view
+    def get_committed_usd(self, grant_id: str) -> int:
+        """Return total USD committed across all milestones of a grant."""
+        if grant_id not in self.grants:
+            return 0
+        grant = json.loads(self.grants[grant_id])
+        return int(grant.get("committed_usd", 0))
 
     @gl.public.view
     def get_milestone_status(self, milestone_id: str) -> str:
